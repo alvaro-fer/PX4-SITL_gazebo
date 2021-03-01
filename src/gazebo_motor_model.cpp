@@ -209,16 +209,11 @@ void GazeboMotorModel::UpdateForcesAndMoments() {
   //
 #if GAZEBO_MAJOR_VERSION >= 9
   ignition::math::Vector3d body_velocity = link_->WorldLinearVel();
-  ignition::math::Vector3d joint_axis = joint_->GlobalAxis(0);
 #else
   ignition::math::Vector3d body_velocity = ignitionFromGazeboMath(link_->GetWorldLinearVel());
-  ignition::math::Vector3d joint_axis = ignitionFromGazeboMath(joint_->GetGlobalAxis(0));
 #endif
-
-  ignition::math::Vector3d relative_wind_velocity = body_velocity - wind_vel_;
-  ignition::math::Vector3d velocity_parallel_to_rotor_axis = (relative_wind_velocity.Dot(joint_axis)) * joint_axis;
-  double vel = velocity_parallel_to_rotor_axis.Length();
-  double scalar = 1 - vel / 25.0; // at 25 m/s the rotor will not produce any force anymore
+  double vel = body_velocity.Length();
+  double scalar = 1 - vel / 25.0; // at 50 m/s the rotor will not produce any force anymore
   scalar = ignition::math::clamp(scalar, 0.0, 1.0);
   // Apply a force to the link.
   link_->AddRelativeForce(ignition::math::Vector3d(0, 0, force * scalar));
@@ -227,8 +222,14 @@ void GazeboMotorModel::UpdateForcesAndMoments() {
   // 2010 IEEE Conference on Robotics and Automation paper
   // The True Role of Accelerometer Feedback in Quadrotor Control
   // - \omega * \lambda_1 * V_A^{\perp}
-  ignition::math::Vector3d velocity_perpendicular_to_rotor_axis = relative_wind_velocity - (relative_wind_velocity.Dot(joint_axis)) * joint_axis;
-  ignition::math::Vector3d air_drag = -std::abs(real_motor_velocity) * rotor_drag_coefficient_ * velocity_perpendicular_to_rotor_axis;
+#if GAZEBO_MAJOR_VERSION >= 9
+  ignition::math::Vector3d joint_axis = joint_->GlobalAxis(0);
+#else
+  ignition::math::Vector3d joint_axis = ignitionFromGazeboMath(joint_->GetGlobalAxis(0));
+#endif
+  ignition::math::Vector3d relative_wind_velocity = body_velocity - wind_vel_;
+  ignition::math::Vector3d body_velocity_perpendicular = relative_wind_velocity - (relative_wind_velocity.Dot(joint_axis)) * joint_axis;
+  ignition::math::Vector3d air_drag = -std::abs(real_motor_velocity) * rotor_drag_coefficient_ * body_velocity_perpendicular;
   // Apply air_drag to link.
   link_->AddForce(air_drag);
   // Moments
@@ -247,7 +248,7 @@ void GazeboMotorModel::UpdateForcesAndMoments() {
 
   ignition::math::Vector3d rolling_moment;
   // - \omega * \mu_1 * V_A^{\perp}
-  rolling_moment = -std::abs(real_motor_velocity) * rolling_moment_coefficient_ * velocity_perpendicular_to_rotor_axis;
+  rolling_moment = -std::abs(real_motor_velocity) * rolling_moment_coefficient_ * body_velocity_perpendicular;
   parent_links.at(0)->AddTorque(rolling_moment);
   // Apply the filter on the motor's velocity.
   double ref_motor_rot_vel;

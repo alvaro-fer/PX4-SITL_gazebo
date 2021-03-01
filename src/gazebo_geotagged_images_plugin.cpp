@@ -15,7 +15,7 @@
  *
 */
 
-#include "gazebo_camera_manager_plugin.h"
+#include "gazebo_geotagged_images_plugin.h"
 
 #include <math.h>
 #include <string>
@@ -30,26 +30,41 @@ using namespace cv;
 
 // #define DEBUG_MESSAGE_IO
 
-GZ_REGISTER_SENSOR_PLUGIN(CameraManagerPlugin)
+GZ_REGISTER_SENSOR_PLUGIN(GeotaggedImagesPlugin)
 
 static void* start_thread(void* param) {
-    CameraManagerPlugin* plugin = (CameraManagerPlugin*)param;
+    GeotaggedImagesPlugin* plugin = (GeotaggedImagesPlugin*)param;
     plugin->cameraThread();
     return nullptr;
 }
 
-CameraManagerPlugin::CameraManagerPlugin()
+GeotaggedImagesPlugin::GeotaggedImagesPlugin()
     : SensorPlugin()
+    , _imageCounter(0)
+    , _width(0)
+    , _height(0)
+    , _depth(0)
+    , _destWidth(0)
+    , _destHeight(0)
+    , _captureCount(0)
+    , _captureInterval(0.0)
+    , _fd(-1)
+    , _mode(CAMERA_MODE_VIDEO)
+    , _captureMode(CAPTURE_DISABLED)
+    , _hfov(1.57)
+    , _zoom(1.0)
+    , _maxZoom(8.0)
+    , _zoom_cmd(0)
 {
 }
 
-CameraManagerPlugin::~CameraManagerPlugin()
+GeotaggedImagesPlugin::~GeotaggedImagesPlugin()
 {
     _parentSensor.reset();
     _camera.reset();
 }
 
-void CameraManagerPlugin::Load(sensors::SensorPtr sensor, sdf::ElementPtr sdf)
+void GeotaggedImagesPlugin::Load(sensors::SensorPtr sensor, sdf::ElementPtr sdf)
 {
     if (!sensor)
         gzerr << "Invalid sensor pointer.\n";
@@ -63,7 +78,7 @@ void CameraManagerPlugin::Load(sensors::SensorPtr sensor, sdf::ElementPtr sdf)
 
     if (!_parentSensor)
     {
-        gzerr << "CameraManagerPlugin requires a CameraSensor.\n";
+        gzerr << "GeotaggedImagesPlugin requires a CameraSensor.\n";
     }
 
 #if GAZEBO_MAJOR_VERSION >= 7
@@ -74,7 +89,7 @@ void CameraManagerPlugin::Load(sensors::SensorPtr sensor, sdf::ElementPtr sdf)
 
     if (!_parentSensor)
     {
-        gzerr << "CameraManagerPlugin not attached to a camera sensor\n";
+        gzerr << "GeotaggedImagesPlugin not attached to a camera sensor\n";
         return;
     }
     _scene = _camera->GetScene();
@@ -114,19 +129,6 @@ void CameraManagerPlugin::Load(sensors::SensorPtr sensor, sdf::ElementPtr sdf)
         _maxZoom = sdf->GetElement("maximum_zoom")->Get<float>();
     }
 
-    if (sdf->HasElement("video_uri")) {
-        _videoURI = sdf->GetElement("video_uri")->Get<int>();
-    }
-    if (sdf->HasElement("system_id")) {
-        _systemID = sdf->GetElement("system_id")->Get<int>();
-    }
-    if (sdf->HasElement("cam_component_id")) {
-        _componentID = sdf->GetElement("cam_component_id")->Get<int>();
-    }
-    if (sdf->HasElement("mavlink_cam_udp_port")) {
-        _mavlinkCamPort = sdf->GetElement("mavlink_cam_udp_port")->Get<int>();
-    }
-
     //check if exiftool exists
     if (system("exiftool -ver &>/dev/null") != 0) {
         gzerr << "exiftool not found. geotagging_images plugin will be disabled" << endl;
@@ -152,9 +154,9 @@ void CameraManagerPlugin::Load(sensors::SensorPtr sensor, sdf::ElementPtr sdf)
     const std::string parentSensorModelName = names_splitted.rbegin()[1];
 
     _newFrameConnection = _camera->ConnectNewImageFrame(
-                              boost::bind(&CameraManagerPlugin::OnNewFrame, this, _1));
+                              boost::bind(&GeotaggedImagesPlugin::OnNewFrame, this, _1));
 
-    _gpsSub = _node_handle->Subscribe("~/" + rootModelName + "/link/gps", &CameraManagerPlugin::OnNewGpsPosition, this);
+    _gpsSub = _node_handle->Subscribe("~/" + rootModelName + "/gps", &GeotaggedImagesPlugin::OnNewGpsPosition, this);
 
     _storageDir = "frames";
     boost::filesystem::remove_all(_storageDir); //clear existing images
@@ -167,14 +169,14 @@ void CameraManagerPlugin::Load(sensors::SensorPtr sensor, sdf::ElementPtr sdf)
     }
 }
 
-void CameraManagerPlugin::OnNewGpsPosition(GpsPtr& gps_msg) {
+void GeotaggedImagesPlugin::OnNewGpsPosition(GpsPtr& gps_msg) {
     _lastGpsPosition.X() = gps_msg->latitude_deg();
     _lastGpsPosition.Y() = gps_msg->longitude_deg();
     _lastGpsPosition.Z() = gps_msg->altitude();
     //gzdbg << "got gps pos: "<<_lastGpsPosition.X() <<", "<<lastGpsPosition.Y() <<endl;
 }
 
-void CameraManagerPlugin::OnNewFrame(const unsigned char * image)
+void GeotaggedImagesPlugin::OnNewFrame(const unsigned char * image)
 {
 
     _captureMutex.lock();
@@ -240,18 +242,15 @@ void CameraManagerPlugin::OnNewFrame(const unsigned char * image)
              " -gpsmeasuremode=3-d -gpssatellites=13 -gpsaltitude=%.3lf -overwrite_original %s &>/dev/null",
              north_south, east_west, lat, lon, _lastGpsPosition.Z(), file_name);
 
-    if (system(gps_tag_command) < 0) {
-        gzerr << "gps tag command failed" << endl;
-        return;
-    }
+    system(gps_tag_command);
 
     gzmsg << "Took picture: " << file_name << endl;
 
     // Send indication to GCS
     mavlink_message_t msg;
     mavlink_msg_camera_image_captured_pack_chan(
-        _systemID,
-        _componentID,
+        1,
+        MAV_COMP_ID_CAMERA,
         MAVLINK_COMM_1,
         &msg,
         currentTime.Double() * 1e3, // time boot ms
@@ -288,7 +287,7 @@ void CameraManagerPlugin::OnNewFrame(const unsigned char * image)
     _send_capture_status();
 }
 
-void CameraManagerPlugin::_handle_message(mavlink_message_t *msg, struct sockaddr* srcaddr)
+void GeotaggedImagesPlugin::_handle_message(mavlink_message_t *msg, struct sockaddr* srcaddr)
 {
 #if defined(DEBUG_MESSAGE_IO)
     sockaddr_in* foo = (sockaddr_in*)srcaddr;
@@ -303,7 +302,7 @@ void CameraManagerPlugin::_handle_message(mavlink_message_t *msg, struct sockadd
         mavlink_command_long_t cmd;
         mavlink_msg_command_long_decode(msg, &cmd);
         mavlink_command_long_t digicam_ctrl_cmd;
-        if (cmd.target_component == _componentID) {
+        if (cmd.target_component == MAV_COMP_ID_CAMERA) {
             switch (cmd.command) {
             case MAV_CMD_IMAGE_START_CAPTURE:
                 _handle_take_photo(msg, srcaddr);
@@ -344,21 +343,13 @@ void CameraManagerPlugin::_handle_message(mavlink_message_t *msg, struct sockadd
                 // Just ACK and ignore
                 _send_cmd_ack(msg->sysid, msg->compid, MAV_CMD_STORAGE_FORMAT, MAV_RESULT_ACCEPTED, srcaddr);
                 break;
-            case MAV_CMD_VIDEO_START_STREAMING:
-                // Just ACK and ignore
-                _send_cmd_ack(msg->sysid, msg->compid, MAV_CMD_VIDEO_START_STREAMING, MAV_RESULT_ACCEPTED, srcaddr);
-                break;
-            case MAV_CMD_VIDEO_STOP_STREAMING:
-                // Just ACK and ignore
-                _send_cmd_ack(msg->sysid, msg->compid, MAV_CMD_VIDEO_STOP_STREAMING, MAV_RESULT_ACCEPTED, srcaddr);
-                break;
             }
         }
         break;
     }
 }
 
-void CameraManagerPlugin::_send_mavlink_message(const mavlink_message_t *message, struct sockaddr* srcaddr)
+void GeotaggedImagesPlugin::_send_mavlink_message(const mavlink_message_t *message, struct sockaddr* srcaddr)
 {
     struct sockaddr* target = srcaddr ? srcaddr : (struct sockaddr *)&_gcsaddr;
     uint8_t buffer[MAVLINK_MAX_PACKET_LEN];
@@ -376,12 +367,12 @@ void CameraManagerPlugin::_send_mavlink_message(const mavlink_message_t *message
     }
 }
 
-void CameraManagerPlugin::_send_cmd_ack(uint8_t target_sysid, uint8_t target_compid, uint16_t cmd, unsigned char result, struct sockaddr* srcaddr)
+void GeotaggedImagesPlugin::_send_cmd_ack(uint8_t target_sysid, uint8_t target_compid, uint16_t cmd, unsigned char result, struct sockaddr* srcaddr)
 {
     mavlink_message_t msg;
     mavlink_msg_command_ack_pack_chan(
-        _systemID,
-        _componentID,
+        1,
+        MAV_COMP_ID_CAMERA,
         MAVLINK_COMM_1,
         &msg,
         cmd,
@@ -393,10 +384,10 @@ void CameraManagerPlugin::_send_cmd_ack(uint8_t target_sysid, uint8_t target_com
     _send_mavlink_message(&msg, srcaddr);
 }
 
-void CameraManagerPlugin::_send_heartbeat()
+void GeotaggedImagesPlugin::_send_heartbeat()
 {
     mavlink_message_t msg;
-    mavlink_msg_heartbeat_pack_chan(_systemID, _componentID, MAVLINK_COMM_1, &msg, MAV_TYPE_GENERIC, MAV_AUTOPILOT_GENERIC, 0, 0, 0);
+    mavlink_msg_heartbeat_pack_chan(1, MAV_COMP_ID_CAMERA, MAVLINK_COMM_1, &msg, MAV_TYPE_GENERIC, MAV_AUTOPILOT_GENERIC, 0, 0, 0);
     // Send to GCS port directly
     _send_mavlink_message(&msg);
     // Gazebo log output is using buffered IO for some reason
@@ -404,7 +395,7 @@ void CameraManagerPlugin::_send_heartbeat()
     fflush(stderr);
 }
 
-void CameraManagerPlugin::cameraThread() {
+void GeotaggedImagesPlugin::cameraThread() {
     mavlink_status_t  status;
     mavlink_message_t msg;
     unsigned char buffer[16 * 1024];
@@ -449,7 +440,7 @@ void CameraManagerPlugin::cameraThread() {
     }
 }
 
-bool CameraManagerPlugin::_init_udp(sdf::ElementPtr sdf) {
+bool GeotaggedImagesPlugin::_init_udp(sdf::ElementPtr sdf) {
     //-- Target
     uint32_t mavlink_addr = htonl(INADDR_LOOPBACK);
     /* TODO: We need to find if the system is setup for broadcast
@@ -477,7 +468,7 @@ bool CameraManagerPlugin::_init_udp(sdf::ElementPtr sdf) {
     _myaddr.sin_family = AF_INET;
     _myaddr.sin_addr.s_addr = htonl(INADDR_ANY);
     // Choose the default cam port
-    _myaddr.sin_port = htons(_mavlinkCamPort);
+    _myaddr.sin_port = htons(14530);
     if (::bind(_fd, (struct sockaddr *)&_myaddr, sizeof(_myaddr)) < 0) {
         gzerr << "Bind failed for camera UDP plugin" << endl;
         return false;
@@ -489,11 +480,11 @@ bool CameraManagerPlugin::_init_udp(sdf::ElementPtr sdf) {
     _fds[0].events = POLLIN;
     mavlink_status_t* chan_state = mavlink_get_channel_status(MAVLINK_COMM_1);
     chan_state->flags &= ~(MAVLINK_STATUS_FLAG_OUT_MAVLINK1);
-    gzmsg << "[Camera manager plugin]: Camera on udp port " + std::to_string(_mavlinkCamPort) + "\n";
+    gzmsg << "Camera on udp port 14530\n";
     return true;
 }
 
-void CameraManagerPlugin::_handle_take_photo(const mavlink_message_t *pMsg, struct sockaddr* srcaddr)
+void GeotaggedImagesPlugin::_handle_take_photo(const mavlink_message_t *pMsg, struct sockaddr* srcaddr)
 {
 
     gzdbg << "Handle Start Capture" << endl;
@@ -526,7 +517,7 @@ void CameraManagerPlugin::_handle_take_photo(const mavlink_message_t *pMsg, stru
     }
 }
 
-void CameraManagerPlugin::_handle_stop_take_photo(const mavlink_message_t *pMsg, struct sockaddr* srcaddr)
+void GeotaggedImagesPlugin::_handle_stop_take_photo(const mavlink_message_t *pMsg, struct sockaddr* srcaddr)
 {
 
     gzdbg << "Handle Stop Capture" << endl;
@@ -538,7 +529,7 @@ void CameraManagerPlugin::_handle_stop_take_photo(const mavlink_message_t *pMsg,
                   MAV_CMD_IMAGE_STOP_CAPTURE, MAV_RESULT_ACCEPTED, srcaddr);
 }
 
-void CameraManagerPlugin::_handle_request_camera_capture_status(const mavlink_message_t *pMsg, struct sockaddr* srcaddr)
+void GeotaggedImagesPlugin::_handle_request_camera_capture_status(const mavlink_message_t *pMsg, struct sockaddr* srcaddr)
 {
     mavlink_command_long_t cmd;
     mavlink_msg_command_long_decode(pMsg, &cmd);
@@ -554,21 +545,21 @@ void CameraManagerPlugin::_handle_request_camera_capture_status(const mavlink_me
     _send_capture_status(srcaddr);
 }
 
-void CameraManagerPlugin::_handle_camera_info(const mavlink_message_t *pMsg, struct sockaddr* srcaddr)
+void GeotaggedImagesPlugin::_handle_camera_info(const mavlink_message_t *pMsg, struct sockaddr* srcaddr)
 {
     gzdbg << "Send camera info" << endl;
     _send_cmd_ack(pMsg->sysid, pMsg->compid, MAV_CMD_REQUEST_CAMERA_INFORMATION, MAV_RESULT_ACCEPTED, srcaddr);
-    static const char vendor[MAVLINK_MSG_CAMERA_INFORMATION_FIELD_VENDOR_NAME_LEN] = "PX4.io";
-    static const char model[MAVLINK_MSG_CAMERA_INFORMATION_FIELD_MODEL_NAME_LEN] = "Gazebo";
-    static const char uri[MAVLINK_MSG_CAMERA_INFORMATION_FIELD_CAM_DEFINITION_URI_LEN] = {};
+    static const char* vendor = "PX4.io";
+    static const char* model  = "Gazebo";
+    char uri[128] = {};
     uint32_t camera_capabilities = CAMERA_CAP_FLAGS_CAPTURE_IMAGE | CAMERA_CAP_FLAGS_CAPTURE_VIDEO |
             CAMERA_CAP_FLAGS_HAS_MODES | CAMERA_CAP_FLAGS_HAS_BASIC_ZOOM |
             CAMERA_CAP_FLAGS_HAS_VIDEO_STREAM;
 
     mavlink_message_t msg;
     mavlink_msg_camera_information_pack_chan(
-        _systemID,
-        _componentID,
+        1,
+        MAV_COMP_ID_CAMERA,
         MAVLINK_COMM_1,
         &msg,
         0,                         // time_boot_ms
@@ -588,7 +579,7 @@ void CameraManagerPlugin::_handle_camera_info(const mavlink_message_t *pMsg, str
     _send_mavlink_message(&msg, srcaddr);
 }
 
-void CameraManagerPlugin::_handle_request_camera_settings(const mavlink_message_t *pMsg, struct sockaddr* srcaddr)
+void GeotaggedImagesPlugin::_handle_request_camera_settings(const mavlink_message_t *pMsg, struct sockaddr* srcaddr)
 {
     gzdbg << "Send camera settings" << endl;
     mavlink_command_long_t cmd;
@@ -603,8 +594,8 @@ void CameraManagerPlugin::_handle_request_camera_settings(const mavlink_message_
     _send_cmd_ack(pMsg->sysid, pMsg->compid, MAV_CMD_REQUEST_CAMERA_SETTINGS, MAV_RESULT_ACCEPTED, srcaddr);
     mavlink_message_t msg;
     mavlink_msg_camera_settings_pack_chan(
-        _systemID,
-        _componentID,
+        1,
+        MAV_COMP_ID_CAMERA,
         MAVLINK_COMM_1,
         &msg,
         0,                      // time_boot_ms
@@ -614,7 +605,7 @@ void CameraManagerPlugin::_handle_request_camera_settings(const mavlink_message_
     _send_mavlink_message(&msg, srcaddr);
 }
 
-void CameraManagerPlugin::_handle_request_video_stream_status(const mavlink_message_t *pMsg, struct sockaddr* srcaddr)
+void GeotaggedImagesPlugin::_handle_request_video_stream_status(const mavlink_message_t *pMsg, struct sockaddr* srcaddr)
 {
     gzdbg << "Send videostream status" << endl;
     mavlink_command_long_t cmd;
@@ -630,8 +621,8 @@ void CameraManagerPlugin::_handle_request_video_stream_status(const mavlink_mess
     _send_cmd_ack(pMsg->sysid, pMsg->compid, MAV_CMD_REQUEST_VIDEO_STREAM_STATUS, MAV_RESULT_ACCEPTED, srcaddr);
     mavlink_message_t msg;
     mavlink_msg_video_stream_status_pack_chan(
-        _systemID,
-        _componentID,                                     // Component ID
+        1,
+        MAV_COMP_ID_CAMERA,                                     // Component ID
         MAVLINK_COMM_1,
         &msg,
         static_cast<uint8_t>(sid),                              // Stream ID
@@ -646,7 +637,7 @@ void CameraManagerPlugin::_handle_request_video_stream_status(const mavlink_mess
     _send_mavlink_message(&msg, srcaddr);
 }
 
-void CameraManagerPlugin::_handle_request_video_stream_information(const mavlink_message_t *pMsg, struct sockaddr* srcaddr)
+void GeotaggedImagesPlugin::_handle_request_video_stream_information(const mavlink_message_t *pMsg, struct sockaddr* srcaddr)
 {
     gzdbg << "Send videostream information" << endl;
     char name[MAVLINK_MSG_VIDEO_STREAM_INFORMATION_FIELD_NAME_LEN] = {};
@@ -662,12 +653,12 @@ void CameraManagerPlugin::_handle_request_video_stream_information(const mavlink
 
     // ACK command received and accepted
     _send_cmd_ack(pMsg->sysid, pMsg->compid, MAV_CMD_REQUEST_VIDEO_STREAM_INFORMATION, MAV_RESULT_ACCEPTED, srcaddr);
-    std::string uri = std::to_string(_videoURI);
+    std::string uri = "5600";
 
     mavlink_message_t msg;
     mavlink_msg_video_stream_information_pack_chan(
-        _systemID,
-        _componentID,                         // Component ID
+        1,
+        MAV_COMP_ID_CAMERA,                         // Component ID
         MAVLINK_COMM_1,
         &msg,
         1,                                          // Stream ID
@@ -686,7 +677,7 @@ void CameraManagerPlugin::_handle_request_video_stream_information(const mavlink
     _send_mavlink_message(&msg, srcaddr);
 }
 
-void CameraManagerPlugin::_handle_set_camera_mode(const mavlink_message_t *pMsg, struct sockaddr* srcaddr)
+void GeotaggedImagesPlugin::_handle_set_camera_mode(const mavlink_message_t *pMsg, struct sockaddr* srcaddr)
 {
     mavlink_command_long_t cmd;
     mavlink_msg_command_long_decode(pMsg, &cmd);
@@ -700,7 +691,7 @@ void CameraManagerPlugin::_handle_set_camera_mode(const mavlink_message_t *pMsg,
 
 }
 
-void CameraManagerPlugin::_handle_camera_zoom(const mavlink_message_t *pMsg, struct sockaddr* srcaddr)
+void GeotaggedImagesPlugin::_handle_camera_zoom(const mavlink_message_t *pMsg, struct sockaddr* srcaddr)
 {
     mavlink_command_long_t cmd;
     mavlink_msg_command_long_decode(pMsg, &cmd);
@@ -716,7 +707,7 @@ void CameraManagerPlugin::_handle_camera_zoom(const mavlink_message_t *pMsg, str
     }
 }
 
-void CameraManagerPlugin::_send_capture_status(struct sockaddr* srcaddr)
+void GeotaggedImagesPlugin::_send_capture_status(struct sockaddr* srcaddr)
 {
     _captureMutex.lock();
     int status = _captureMode == CAPTURE_DISABLED ? 0 : (_captureMode == CAPTURE_SINGLE ? 1 : 3);
@@ -735,8 +726,8 @@ void CameraManagerPlugin::_send_capture_status(struct sockaddr* srcaddr)
 
     mavlink_message_t msg;
     mavlink_msg_camera_capture_status_pack_chan(
-        _systemID,
-        _componentID,
+        1,
+        MAV_COMP_ID_CAMERA,
         MAVLINK_COMM_1,
         &msg,
         current_time.Double() * 1e3,
@@ -749,20 +740,19 @@ void CameraManagerPlugin::_send_capture_status(struct sockaddr* srcaddr)
     _send_mavlink_message(&msg, srcaddr);
 }
 
-void CameraManagerPlugin::_handle_storage_info(const mavlink_message_t *pMsg, struct sockaddr* srcaddr)
+void GeotaggedImagesPlugin::_handle_storage_info(const mavlink_message_t *pMsg, struct sockaddr* srcaddr)
 {
     gzdbg << "Send storage info" << endl;
     float total_mib     = 0.0f;
     float available_mib = 0.0f;
     boost::filesystem::space_info si = boost::filesystem::space(".");
-    const std::string storage_name = "SITL Camera Storage";
     available_mib = (float)((double)si.available / (1024.0 * 1024.0));
     total_mib     = (float)((double)si.capacity  / (1024.0 * 1024.0));
     _send_cmd_ack(pMsg->sysid, pMsg->compid, MAV_CMD_REQUEST_STORAGE_INFORMATION, MAV_RESULT_ACCEPTED, srcaddr);
     mavlink_message_t msg;
     mavlink_msg_storage_information_pack_chan(
-        _systemID,
-        _componentID,
+        1,
+        MAV_COMP_ID_CAMERA,
         MAVLINK_COMM_1,
         &msg,
         0,                                  // time_boot_ms
@@ -773,9 +763,7 @@ void CameraManagerPlugin::_handle_storage_info(const mavlink_message_t *pMsg, st
         total_mib - available_mib,          // used_capacity,
         available_mib,
         NAN,                                // read_speed,
-        NAN,                                // write_speed
-        STORAGE_TYPE_OTHER,                 // storage type
-        storage_name.c_str()                // storage name
+        NAN                                 // write_speed
     );
     _send_mavlink_message(&msg, srcaddr);
 }

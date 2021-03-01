@@ -1,7 +1,27 @@
 #include "mavlink_interface.h"
 
 MavlinkInterface::MavlinkInterface() :
-    serial_dev_(io_service_){
+    received_first_actuator_(false),
+    qgc_socket_fd_(0),
+    sdk_socket_fd_(0), 
+    simulator_socket_fd_(0),
+    simulator_tcp_client_fd_(0),
+    serial_enabled_(false),
+    m_status {},
+    m_buffer {},
+    mavlink_addr_str_("INADDR_ANY"),
+    mavlink_udp_port_(kDefaultMavlinkUdpPort),
+    mavlink_tcp_port_(kDefaultMavlinkTcpPort),
+    qgc_udp_port_(kDefaultQGCUdpPort),
+    sdk_udp_port_(kDefaultSDKUdpPort),
+    qgc_addr_("INADDR_ANY"),
+    sdk_addr_("INADDR_ANY"),
+    io_service(),
+    serial_dev(io_service),
+    device_(kDefaultDevice),
+    baudrate_(kDefaultBaudRate),
+    tx_q {},
+    rx_buf {} {
 
 }
 
@@ -77,13 +97,13 @@ void MavlinkInterface::Load()
 
   if (serial_enabled_) {
     // Set up serial interface
-	  io_service_.post(std::bind(&MavlinkInterface::do_serial_read, this));
+    io_service.post(std::bind(&MavlinkInterface::do_read, this));
 
     // run io_service for async io
-    io_thread_ = std::thread([this] () {
-    	io_service_.run();
+    io_thread = std::thread([this] () {
+      io_service.run();
     });
-    open_serial();
+    open();
 
   } else {
     memset((char *)&remote_simulator_addr_, 0, sizeof(remote_simulator_addr_));
@@ -197,7 +217,7 @@ void MavlinkInterface::pollForMAVLinkMessages()
     return;
   }
 
-  received_actuator_ = false;
+  bool received_actuator = false;
 
   do {
     int timeout_ms = (received_first_actuator_ && enable_lockstep_) ? 1000 : 0;
@@ -225,7 +245,7 @@ void MavlinkInterface::pollForMAVLinkMessages()
       if (i == LISTEN_FD) { // if event is raised on the listening socket
         acceptConnections();
       } else { // if event is raised on connection socket
-        int ret = recvfrom(fds_[i].fd, buf_, sizeof(buf_), 0, (struct sockaddr *)&remote_simulator_addr_, &remote_simulator_addr_len_);
+        int ret = recvfrom(fds_[i].fd, _buf, sizeof(_buf), 0, (struct sockaddr *)&remote_simulator_addr_, &remote_simulator_addr_len_);
         if (ret < 0) {
           // all data is read if EWOULDBLOCK is raised
           if (errno != EWOULDBLOCK) { // disconnected from client
@@ -246,16 +266,16 @@ void MavlinkInterface::pollForMAVLinkMessages()
         mavlink_message_t msg;
         mavlink_status_t status;
         for (unsigned i = 0; i < len; ++i) {
-          if (mavlink_parse_char(MAVLINK_COMM_0, buf_[i], &msg, &status)) {
+          if (mavlink_parse_char(MAVLINK_COMM_0, _buf[i], &msg, &status)) {
             if (hil_mode_) {
               send_mavlink_message(&msg);
             }
-            handle_message(&msg);
+            handle_message(&msg, received_actuator);
           }
         }
       }
     }
-  } while (!close_conn_ && received_first_actuator_ && !received_actuator_ && enable_lockstep_ && !gotSigInt_);
+  } while (!close_conn_ && received_first_actuator_ && !received_actuator && enable_lockstep_ && !gotSigInt_);
 }
 
 void MavlinkInterface::pollFromQgcAndSdk()
@@ -276,13 +296,13 @@ void MavlinkInterface::pollFromQgcAndSdk()
   }
 
   if (fds[0].revents & POLLIN) {
-    int len = recvfrom(qgc_socket_fd_, buf_, sizeof(buf_), 0, (struct sockaddr *)&remote_qgc_addr_, &remote_qgc_addr_len_);
+    int len = recvfrom(qgc_socket_fd_, _buf, sizeof(_buf), 0, (struct sockaddr *)&remote_qgc_addr_, &remote_qgc_addr_len_);
 
     if (len > 0) {
       mavlink_message_t msg;
       mavlink_status_t status;
       for (unsigned i = 0; i < len; ++i) {
-        if (mavlink_parse_char(MAVLINK_COMM_1, buf_[i], &msg, &status)) {
+        if (mavlink_parse_char(MAVLINK_COMM_1, _buf[i], &msg, &status)) {
           // forward message from QGC to serial
           send_mavlink_message(&msg);
         }
@@ -291,13 +311,13 @@ void MavlinkInterface::pollFromQgcAndSdk()
   }
 
   if (fds[1].revents & POLLIN) {
-    int len = recvfrom(sdk_socket_fd_, buf_, sizeof(buf_), 0, (struct sockaddr *)&remote_sdk_addr_, &remote_sdk_addr_len_);
+    int len = recvfrom(sdk_socket_fd_, _buf, sizeof(_buf), 0, (struct sockaddr *)&remote_sdk_addr_, &remote_sdk_addr_len_);
 
     if (len > 0) {
       mavlink_message_t msg;
       mavlink_status_t status;
       for (unsigned i = 0; i < len; ++i) {
-        if (mavlink_parse_char(MAVLINK_COMM_2, buf_[i], &msg, &status)) {
+        if (mavlink_parse_char(MAVLINK_COMM_2, _buf[i], &msg, &status)) {
           // forward message from SDK to serial
           send_mavlink_message(&msg);
         }
@@ -328,11 +348,11 @@ void MavlinkInterface::acceptConnections()
   fds_[CONNECTION_FD].events = POLLIN | POLLOUT; // read/write
 }
 
-void MavlinkInterface::handle_message(mavlink_message_t *msg)
+void MavlinkInterface::handle_message(mavlink_message_t *msg, bool &received_actuator)
 {
   switch (msg->msgid) {
   case MAVLINK_MSG_ID_HIL_ACTUATOR_CONTROLS:
-    const std::lock_guard<std::mutex> lock(actuator_mutex_);
+    const std::lock_guard<std::mutex> lock(actuator_mutex);
 
     mavlink_hil_actuator_controls_t controls;
     mavlink_msg_hil_actuator_controls_decode(msg, &controls);
@@ -349,7 +369,7 @@ void MavlinkInterface::handle_message(mavlink_message_t *msg)
       input_reference_[i] = controls.controls[i];
     }
 
-    received_actuator_ = true;
+    received_actuator = true;
     received_first_actuator_ = true;
     break;
   }
@@ -392,20 +412,20 @@ void MavlinkInterface::send_mavlink_message(const mavlink_message_t *message)
 
   if (serial_enabled_) {
 
-    if (!is_serial_open()) {
+    if (!is_open()) {
       std::cerr << "Serial port closed! \n";
       return;
     }
 
     {
-      std::lock_guard<std::recursive_mutex> lock(mutex_);
+      std::lock_guard<std::recursive_mutex> lock(mutex);
 
-      if (tx_q_.size() >= MAX_TXQ_SIZE) {
+      if (tx_q.size() >= MAX_TXQ_SIZE) {
         std::cout << "Tx queue overflow\n";
       }
-      tx_q_.emplace_back(message);
+      tx_q.emplace_back(message);
     }
-    io_service_.post(std::bind(&MavlinkInterface::do_serial_write, this, true));
+    io_service.post(std::bind(&MavlinkInterface::do_write, this, true));
 
   } else {
     uint8_t buffer[MAVLINK_MAX_PACKET_LEN];
@@ -430,7 +450,7 @@ void MavlinkInterface::send_mavlink_message(const mavlink_message_t *message)
         return;
       }
 
-      ssize_t len;
+      size_t len;
       if (use_tcp_) {
         len = send(fds_[CONNECTION_FD].fd, buffer, packetlen, 0);
       } else {
@@ -449,14 +469,14 @@ void MavlinkInterface::send_mavlink_message(const mavlink_message_t *message)
   }
 }
 
-void MavlinkInterface::open_serial() {
+void MavlinkInterface::open() {
   try{
-    serial_dev_.open(device_);
-    serial_dev_.set_option(boost::asio::serial_port_base::baud_rate(baudrate_));
-    serial_dev_.set_option(boost::asio::serial_port_base::character_size(8));
-    serial_dev_.set_option(boost::asio::serial_port_base::parity(boost::asio::serial_port_base::parity::none));
-    serial_dev_.set_option(boost::asio::serial_port_base::stop_bits(boost::asio::serial_port_base::stop_bits::one));
-    serial_dev_.set_option(boost::asio::serial_port_base::flow_control(boost::asio::serial_port_base::flow_control::none));
+    serial_dev.open(device_);
+    serial_dev.set_option(boost::asio::serial_port_base::baud_rate(baudrate_));
+    serial_dev.set_option(boost::asio::serial_port_base::character_size(8));
+    serial_dev.set_option(boost::asio::serial_port_base::parity(boost::asio::serial_port_base::parity::none));
+    serial_dev.set_option(boost::asio::serial_port_base::stop_bits(boost::asio::serial_port_base::stop_bits::one));
+    serial_dev.set_option(boost::asio::serial_port_base::flow_control(boost::asio::serial_port_base::flow_control::none));
     std::cout << "Opened serial device " << device_ << "\n";
   }
   catch (boost::system::system_error &err) {
@@ -470,15 +490,15 @@ void MavlinkInterface::close()
     ::close(qgc_socket_fd_);
     ::close(sdk_socket_fd_);
 
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
-    if (!is_serial_open())
+    std::lock_guard<std::recursive_mutex> lock(mutex);
+    if (!is_open())
       return;
 
-    io_service_.stop();
-    serial_dev_.close();
+    io_service.stop();
+    serial_dev.close();
 
-    if (io_thread_.joinable())
-      io_thread_.join();
+    if (io_thread.joinable())
+      io_thread.join();
 
   } else {
 
@@ -491,18 +511,18 @@ void MavlinkInterface::close()
   }
 }
 
-void MavlinkInterface::do_serial_write(bool check_tx_state){
-  if (check_tx_state && tx_in_progress_)
+void MavlinkInterface::do_write(bool check_tx_state){
+  if (check_tx_state && tx_in_progress)
     return;
 
-  std::lock_guard<std::recursive_mutex> lock(mutex_);
-  if (tx_q_.empty())
+  std::lock_guard<std::recursive_mutex> lock(mutex);
+  if (tx_q.empty())
     return;
 
-  tx_in_progress_ = true;
-  auto &buf_ref = tx_q_.front();
+  tx_in_progress = true;
+  auto &buf_ref = tx_q.front();
 
-  serial_dev_.async_write_some(
+  serial_dev.async_write_some(
     boost::asio::buffer(buf_ref.dpos(), buf_ref.nbytes()), [this, &buf_ref] (boost::system::error_code error,   size_t bytes_transferred)
     {
       assert(bytes_transferred <= buf_ref.len);
@@ -511,56 +531,56 @@ void MavlinkInterface::do_serial_write(bool check_tx_state){
       return;
       }
 
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex);
 
-    if (tx_q_.empty()) {
-      tx_in_progress_ = false;
+    if (tx_q.empty()) {
+      tx_in_progress = false;
       return;
     }
 
     buf_ref.pos += bytes_transferred;
     if (buf_ref.nbytes() == 0) {
-      tx_q_.pop_front();
+      tx_q.pop_front();
     }
 
-    if (!tx_q_.empty()) {
-      do_serial_write(false);
+    if (!tx_q.empty()) {
+      do_write(false);
     }
     else {
-      tx_in_progress_ = false;
+      tx_in_progress = false;
     }
   });
 }
 
-void MavlinkInterface::do_serial_read(void)
+void MavlinkInterface::do_read(void)
 {
-  serial_dev_.async_read_some(boost::asio::buffer(rx_buf_), boost::bind(
-      &MavlinkInterface::parse_serial_buffer, this, boost::asio::placeholders::error, boost::asio::placeholders::bytes_transferred
+  serial_dev.async_read_some(boost::asio::buffer(rx_buf), boost::bind(
+      &MavlinkInterface::parse_buffer, this, boost::asio::placeholders::error, boost::asio::placeholders::bytes_transferred
       )
   );
 }
 
 // Based on MAVConnInterface::parse_buffer in MAVROS
-void MavlinkInterface::parse_serial_buffer(const boost::system::error_code& err, std::size_t bytes_t){
+void MavlinkInterface::parse_buffer(const boost::system::error_code& err, std::size_t bytes_t){
   mavlink_status_t status;
   mavlink_message_t message;
-  uint8_t *buf = this->rx_buf_.data();
+  uint8_t *buf = this->rx_buf.data();
 
-  assert(rx_buf_.size() >= bytes_t);
+  assert(rx_buf.size() >= bytes_t);
 
   for(; bytes_t > 0; bytes_t--)
   {
     auto c = *buf++;
 
-    auto msg_received = static_cast<Framing>(mavlink_frame_char_buffer(&m_buffer_, &m_status_, c, &message, &status));
+    auto msg_received = static_cast<Framing>(mavlink_frame_char_buffer(&m_buffer, &m_status, c, &message, &status));
     if (msg_received == Framing::bad_crc || msg_received == Framing::bad_signature) {
-      _mav_parse_error(&m_status_);
-      m_status_.msg_received = MAVLINK_FRAMING_INCOMPLETE;
-      m_status_.parse_state = MAVLINK_PARSE_STATE_IDLE;
+      _mav_parse_error(&m_status);
+      m_status.msg_received = MAVLINK_FRAMING_INCOMPLETE;
+      m_status.parse_state = MAVLINK_PARSE_STATE_IDLE;
       if (c == MAVLINK_STX) {
-        m_status_.parse_state = MAVLINK_PARSE_STATE_GOT_STX;
-        m_buffer_.len = 0;
-        mavlink_start_checksum(&m_buffer_);
+        m_status.parse_state = MAVLINK_PARSE_STATE_GOT_STX;
+        m_buffer.len = 0;
+        mavlink_start_checksum(&m_buffer);
       }
     }
 
@@ -568,10 +588,11 @@ void MavlinkInterface::parse_serial_buffer(const boost::system::error_code& err,
       if (hil_mode_) {
         forward_mavlink_message(&message);
       }
-      handle_message(&message);
+      bool not_used;
+      handle_message(&message, not_used);
     }
   }
-  do_serial_read();
+  do_read();
 }
 
 void MavlinkInterface::onSigInt() {
@@ -580,11 +601,11 @@ void MavlinkInterface::onSigInt() {
 }
 
 Eigen::VectorXd MavlinkInterface::GetActuatorControls() {
-  const std::lock_guard<std::mutex> lock(actuator_mutex_);
+  const std::lock_guard<std::mutex> lock(actuator_mutex);
   return input_reference_;
 }
 
 bool MavlinkInterface::GetArmedState() {
-  const std::lock_guard<std::mutex> lock(actuator_mutex_);
+  const std::lock_guard<std::mutex> lock(actuator_mutex);
   return armed_;
 }

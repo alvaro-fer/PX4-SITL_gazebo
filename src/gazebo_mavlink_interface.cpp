@@ -4,7 +4,7 @@
  * Copyright 2015 Mina Kamel, ASL, ETH Zurich, Switzerland
  * Copyright 2015 Janosch Nikolic, ASL, ETH Zurich, Switzerland
  * Copyright 2015 Markus Achtelik, ASL, ETH Zurich, Switzerland
- * Copyright 2015-2021 PX4 Development Team
+ * Copyright 2015-2018 PX4 Development Team
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,7 +23,48 @@
 namespace gazebo {
 GZ_REGISTER_MODEL_PLUGIN(GazeboMavlinkInterface);
 
-GazeboMavlinkInterface::GazeboMavlinkInterface() : ModelPlugin(){
+GazeboMavlinkInterface::GazeboMavlinkInterface() : ModelPlugin(),
+    received_first_actuator_(false),
+    namespace_(kDefaultNamespace),
+    protocol_version_(2.0),
+    motor_velocity_reference_pub_topic_(kDefaultMotorVelocityReferencePubTopic),
+    use_propeller_pid_(false),
+    use_elevator_pid_(false),
+    use_left_elevon_pid_(false),
+    use_right_elevon_pid_(false),
+    send_vision_estimation_(false),
+    send_odometry_(false),
+    imu_sub_topic_(kDefaultImuTopic),
+    opticalFlow_sub_topic_(kDefaultOpticalFlowTopic),
+    irlock_sub_topic_(kDefaultIRLockTopic),
+    vision_sub_topic_(kDefaultVisionTopic),
+    mag_sub_topic_(kDefaultMagTopic),
+    airspeed_sub_topic_(kDefaultAirspeedTopic),
+    baro_sub_topic_(kDefaultBarometerTopic),
+    sensor_map_ {},
+    wind_sub_topic_(kDefaultWindTopic),
+    model_ {},
+    world_(nullptr),
+    left_elevon_joint_(nullptr),
+    right_elevon_joint_(nullptr),
+    elevator_joint_(nullptr),
+    propeller_joint_(nullptr),
+    gimbal_yaw_joint_(nullptr),
+    gimbal_pitch_joint_(nullptr),
+    gimbal_roll_joint_(nullptr),
+    input_offset_ {},
+    input_scaling_ {},
+    zero_position_disarmed_ {},
+    zero_position_armed_ {},
+    input_index_ {},
+    mag_updated_(false),
+    baro_updated_(false),
+    diff_press_updated_(false),
+    groundtruth_lat_rad(0.0),
+    groundtruth_lon_rad(0.0),
+    groundtruth_altitude(0.0),
+    hil_mode_(false),
+    hil_state_level_(false) {
       mavlink_interface_ = std::make_unique<MavlinkInterface>();
 
 }
@@ -68,63 +109,11 @@ struct SensorHelperStorage {
 template <typename GazeboMsgT>
 void GazeboMavlinkInterface::CreateSensorSubscription(
     void (GazeboMavlinkInterface::*fp)(const boost::shared_ptr<GazeboMsgT const>&, const int&),
-    GazeboMavlinkInterface* ptr, const physics::Joint_V& joints, physics::ModelPtr& nested_model, const std::regex& model) {
-
-  // Get nested sensors on included models
-  std::string nested_sensor_name;
-  if (nested_model != nullptr && std::regex_match(nested_model->GetName(), model)) {
-    const std::string model_name = model_->GetName();
-
-    if (nested_model->GetName().find("::") != std::string::npos) {
-      nested_sensor_name = nested_model->GetName().substr(nested_model->GetName().find("::") + 2);
-    } else {
-      nested_sensor_name = nested_model->GetName();
-    }
-
-    // Get sensor ID sensor name
-    int sensor_id = 0;
-    try {
-      // get the sensor id by getting the (last) numbers on the sensor name (ex. lidar10, gets id 10)
-      sensor_id = std::stoi(nested_sensor_name.substr(nested_sensor_name.find_last_not_of("0123456789") + 1));
-    } catch(...) {
-      gzwarn << "No identifier on joint. Using 0 as default sensor ID" << std::endl;
-    }
-
-    // Get the sensor link orientation with respect to the base_link
-#if GAZEBO_MAJOR_VERSION >= 9
-    const auto sensor_orientation = nested_model->RelativePose().Rot();
-#else
-    const auto sensor_orientation = nested_model->GetChild()->GetRelativePose()).Rot();
-#endif
-
-    // One map will be created for each Gazebo message type
-    static std::map<std::string, SensorHelperStorage<GazeboMsgT> > callback_map;
-
-    // Store the callback entries
-    auto callback_entry = callback_map.emplace(
-        "~/" + model_name + "/link/" + nested_sensor_name,
-        SensorHelperStorage<GazeboMsgT>{ptr, fp, sensor_id});
-
-    // Check if element was already present
-    if (!callback_entry.second)
-      gzerr << "Tried to add element to map but the gazebo topic name was already present in map."
-            << std::endl;
-
-    // Create the subscriber for the sensors
-    auto subscriberPtr = node_handle_->Subscribe("~/" + model_name + "/link/" + nested_sensor_name,
-                                                 &SensorHelperStorage<GazeboMsgT>::callback,
-                                                 &callback_entry.first->second);
-
-    // Store the SubscriberPtr, sensor ID and sensor orientation
-    sensor_map_.insert(std::pair<transport::SubscriberPtr, SensorIdRot_P>(subscriberPtr,
-                                                                          SensorIdRot_P(sensor_id, sensor_orientation))
-                                                                         );
-  }
+    GazeboMavlinkInterface* ptr, const physics::Joint_V& joints, const std::regex& model) {
 
   // Verify if the sensor joint exists
   for (physics::Joint_V::const_iterator it = joints.begin(); it != joints.end(); ++it) {
-    // std::cout << (*it)->GetName() << std::endl;
-    if (std::regex_match((*it)->GetName(), model)) {
+    if (std::regex_match ((*it)->GetName(), model)) {
       // Get sensor joint name (without the ''::joint' suffix)
       const std::string joint_name = (*it)->GetName().substr(0, (*it)->GetName().size() - 6);
 
@@ -135,12 +124,6 @@ void GazeboMavlinkInterface::CreateSensorSubscription(
       std::string sensor_name = joint_name;
       if (pos != std::string::npos) {
         sensor_name = joint_name.substr(pos + 2);
-      }
-
-      // If a nested sensor was already registered with this name
-      // ignore it
-      if (nested_sensor_name == sensor_name) {
-        break;
       }
 
       // Get sensor ID from joint name
@@ -214,7 +197,7 @@ void GazeboMavlinkInterface::Load(physics::ModelPtr _model, sdf::ElementPtr _sdf
   getSdfParam<std::string>(_sdf, "magSubTopic", mag_sub_topic_, mag_sub_topic_);
   getSdfParam<std::string>(_sdf, "airspeedSubTopic", airspeed_sub_topic_, airspeed_sub_topic_);
   getSdfParam<std::string>(_sdf, "baroSubTopic", baro_sub_topic_, baro_sub_topic_);
-  getSdfParam<std::string>(_sdf, "groundtruthSubTopic", groundtruth_sub_topic_, groundtruth_sub_topic_);
+  groundtruth_sub_topic_ = "/groundtruth";
 
   // set input_reference_ from inputs.control
   input_reference_.resize(n_out_max);
@@ -268,6 +251,21 @@ void GazeboMavlinkInterface::Load(physics::ModelPtr _model, sdf::ElementPtr _sdf
                 gztopic_[index]);
 #endif
           }
+	  if (joint_control_type_[index] == "gimbal_control")
+	  {
+   	    printf("Found Gimbal Control\n");
+	    if (channel->HasElement("linkName"))
+            {
+	      printf("Found Gimbal Link.\n");
+	      gimbal_link_name_ = channel->Get<std::string>("linkName");
+	      std::cout<<gimbal_link_name_<<std::endl;
+	    }
+	    else
+	      gzerr << "[gazebo_mavlink_interface] Gimbal Link not specified (thrustpuck).\n";
+	    gimbal_link_ = model_->GetLink(gimbal_link_name_);
+	    if (gimbal_link_ == NULL)
+   	      printf("Gimbal link not found in model.\n");
+	  }
 
           if (channel->HasElement("joint_name"))
           {
@@ -434,21 +432,10 @@ void GazeboMavlinkInterface::Load(physics::ModelPtr _model, sdf::ElementPtr _sdf
   // Get the model joints
   auto joints = model_->GetJoints();
 
-  // Get the base nested model, if nested model exist.
-  // Note: this will only capture the first nested model found on the base model
-  //       which is usually the GPS model of the aircraft (ex: iris_dual_gps
-  //       includes iris and the nested model is iris::gps0).
-  //       As an improvement, this can be made more generic by going through all
-  //       the nested models present in the base model
-  physics::ModelPtr nested_model;
-  if (!model_->NestedModels().empty()) {
-    nested_model = model_->NestedModels()[0];
-  }
-
   // Create subscriptions to the distance sensors
-  CreateSensorSubscription(&GazeboMavlinkInterface::LidarCallback, this, joints, nested_model, kDefaultLidarModelNaming);
-  CreateSensorSubscription(&GazeboMavlinkInterface::SonarCallback, this, joints, nested_model, kDefaultSonarModelNaming);
-  CreateSensorSubscription(&GazeboMavlinkInterface::GpsCallback, this, joints, nested_model, kDefaultGPSModelNaming);
+  CreateSensorSubscription(&GazeboMavlinkInterface::LidarCallback, this, joints, kDefaultLidarModelJointNaming);
+  CreateSensorSubscription(&GazeboMavlinkInterface::SonarCallback, this, joints, kDefaultSonarModelJointNaming);
+  CreateSensorSubscription(&GazeboMavlinkInterface::GpsCallback, this, joints, kDefaultGPSModelJointNaming);
 
   // Publish gazebo's motor_speed message
   motor_velocity_reference_pub_ = node_handle_->Advertise<mav_msgs::msgs::CommandMotorSpeed>("~/" + model_->GetName() + motor_velocity_reference_pub_topic_, 1);
@@ -684,9 +671,9 @@ void GazeboMavlinkInterface::SendSensorMessages()
 
   mavlink_hil_sensor_t sensor_msg;
 #if GAZEBO_MAJOR_VERSION >= 9
-  sensor_msg.time_usec = std::round(world_->SimTime().Double() * 1e6);
+  sensor_msg.time_usec = world_->SimTime().Double() * 1e6;
 #else
-  sensor_msg.time_usec = std::round(world_->GetSimTime().Double() * 1e6);
+  sensor_msg.time_usec = world_->GetSimTime().Double() * 1e6;
 #endif
 
   // send always accel and gyro data (not dependent of the bitmask)
@@ -780,9 +767,9 @@ void GazeboMavlinkInterface::SendGroundTruth()
   // send ground truth
   mavlink_hil_state_quaternion_t hil_state_quat;
 #if GAZEBO_MAJOR_VERSION >= 9
-  hil_state_quat.time_usec = std::round(world_->SimTime().Double() * 1e6);
+  hil_state_quat.time_usec = world_->SimTime().Double() * 1e6;
 #else
-  hil_state_quat.time_usec = std::round(world_->GetSimTime().Double() * 1e6);
+  hil_state_quat.time_usec = world_->GetSimTime().Double() * 1e6;
 #endif
   hil_state_quat.attitude_quaternion[0] = q_nb.W();
   hil_state_quat.attitude_quaternion[1] = q_nb.X();
@@ -793,9 +780,9 @@ void GazeboMavlinkInterface::SendGroundTruth()
   hil_state_quat.pitchspeed = omega_nb_b.Y();
   hil_state_quat.yawspeed = omega_nb_b.Z();
 
-  hil_state_quat.lat = groundtruth_lat_rad_ * 180 / M_PI * 1e7;
-  hil_state_quat.lon = groundtruth_lon_rad_ * 180 / M_PI * 1e7;
-  hil_state_quat.alt = groundtruth_altitude_ * 1000;
+  hil_state_quat.lat = groundtruth_lat_rad * 180 / M_PI * 1e7;
+  hil_state_quat.lon = groundtruth_lon_rad * 180 / M_PI * 1e7;
+  hil_state_quat.alt = groundtruth_altitude * 1000;
 
   hil_state_quat.vx = vel_n.X() * 100;
   hil_state_quat.vy = vel_n.Y() * 100;
@@ -852,9 +839,9 @@ void GazeboMavlinkInterface::GpsCallback(GpsPtr& gps_msg, const int& id) {
 
 void GazeboMavlinkInterface::GroundtruthCallback(GtPtr& groundtruth_msg) {
   // update groundtruth lat_rad, lon_rad and altitude
-  groundtruth_lat_rad_ = groundtruth_msg->latitude_rad();
-  groundtruth_lon_rad_ = groundtruth_msg->longitude_rad();
-  groundtruth_altitude_ = groundtruth_msg->altitude();
+  groundtruth_lat_rad = groundtruth_msg->latitude_rad();
+  groundtruth_lon_rad = groundtruth_msg->longitude_rad();
+  groundtruth_altitude = groundtruth_msg->altitude();
   // the rest of the data is obtained directly on this interface and sent to
   // the FCU
 }
@@ -898,7 +885,7 @@ void GazeboMavlinkInterface::LidarCallback(LidarPtr& lidar_message, const int& i
 
   // distance needed for optical flow message
   if (sensor_msg.orientation == MAV_SENSOR_ORIENTATION::MAV_SENSOR_ROTATION_PITCH_270) {
-    optflow_distance_ = lidar_message->current_distance();  // [m]
+    optflow_distance = lidar_message->current_distance();  // [m]
   }
 
   mavlink_message_t msg;
@@ -929,7 +916,7 @@ void GazeboMavlinkInterface::OpticalFlowCallback(OpticalFlowPtr& opticalFlow_mes
   sensor_msg.temperature = opticalFlow_message->temperature();
   sensor_msg.quality = opticalFlow_message->quality();
   sensor_msg.time_delta_distance_us = opticalFlow_message->time_delta_distance_us();
-  sensor_msg.distance = optflow_distance_;
+  sensor_msg.distance = optflow_distance;
 
   mavlink_message_t msg;
   mavlink_msg_hil_optical_flow_encode_chan(1, 200, MAVLINK_COMM_0, &msg, &sensor_msg);
@@ -969,7 +956,7 @@ void GazeboMavlinkInterface::SonarCallback(SonarPtr& sonar_message, const int& i
 
   // distance needed for optical flow message
   if (sensor_msg.orientation == MAV_SENSOR_ORIENTATION::MAV_SENSOR_ROTATION_PITCH_270) {
-    optflow_distance_ = sonar_message->current_distance();  // [m]
+    optflow_distance = sonar_message->current_distance();  // [m]
   }
 
   mavlink_message_t msg;
@@ -1230,6 +1217,90 @@ void GazeboMavlinkInterface::handle_control(double _dt)
         joints_[i]->SetAngle(0, input_reference_[i]);
      #endif
       }
+      else if (joint_control_type_[i] == "gimbal_control")
+      {
+	      // Invert Kinematics to obtain Gimbal Angles, Thrust and Torque
+	      float input_reference_0_scaled = (input_reference_[0]-500.0f)/500.0f;
+	      float input_reference_1_scaled = (input_reference_[1]-500.0f)/500.0f;
+	      // ######## First Implementation ########
+	      //float T1  = std::max(input_reference_0_scaled*input_reference_0_scaled*2.315572884681237f+input_reference_0_scaled*7.371841975527182f+4.780454834051368f,0.0f);
+	      //float T2  = std::max(input_reference_1_scaled*input_reference_1_scaled*2.315572884681237f+input_reference_1_scaled*7.371841975527182f+4.780454834051368f,0.0f);
+	      //float T   = T1+T2;
+	      //float Tau = (-T1+T2)*0.06;
+	      
+	      // ######## New Implementation ########
+	      float p1 = 0.001f*input_reference_[0]+1.0f;
+	      float p2 = 0.001f*input_reference_[1]+1.0f;
+
+
+	      float T = _thr_1 +
+		        _thr_2 * p1 +
+			_thr_3 * p2 +
+			_thr_4 * p1*p1 +
+			_thr_5 * p1*p2 +
+			_thr_6 * p2*p2 +
+			_thr_7 * p1*p1*p1 +
+			_thr_8 * p1*p1*p2 +
+			_thr_9 * p1*p2*p2 +
+			_thr_10* p2*p2*p2;
+
+	      float Tau = _tau_1 +
+		          _tau_2 * p1 +
+			  _tau_3 * p2 +
+			  _tau_4 * p1*p1 +
+			  _tau_5 * p1*p2 +
+			  _tau_6 * p2*p2 +
+			  _tau_7 * p1*p1*p1 +
+		  	  _tau_8 * p1*p1*p2 +
+			  _tau_9 * p1*p2*p2 +
+			  _tau_10* p2*p2*p2;
+
+	      float dy  = map_angle_inv(-input_reference_[2]/0.776721f,0.0f);
+	      float dx  = map_angle_inv( input_reference_[3]/0.776721f,dy );
+
+	      // Apply Thrust and Torque
+	      gimbal_link_->AddRelativeForce(ignition::math::Vector3d(-T*cos(dx)*sin(dy),-T*sin(dx),T*cos(dx)*cos(dy)));
+	      gimbal_link_->AddRelativeTorque(ignition::math::Vector3d(Tau*cos(dx)*sin(dy),Tau*sin(dx),-Tau*cos(dx)*cos(dy)));
+	      
+	      // Debugging
+	      //printf("Inputs : %7.5f \t %7.5f \t %7.5f \t %7.5f \n", input_reference_0_scaled, input_reference_1_scaled, input_reference_[2], input_reference_[3]);
+	      //printf("Outputs: %7.5f \t %7.5f \t %7.5f \t %7.5f \n", T, Tau, dy, dx);
+	      //printf("Outputs: %7.5f \t %7.5f \t %7.5f \t %7.5f \n", T1, T2, dy, dx);
+	      //printf("Tx = %7.5f \t Ty = %7.5f \t Tz = %7.5f\n",-T*cos(dx)*sin(dy),T*sin(dx),-T*cos(dx)*cos(dy));
+
+      }
+      else if (joint_control_type_[i] == "position_gimbal_y")
+      {
+#if GAZEBO_MAJOR_VERSION >= 9
+        double current = joints_[i]->Position(0);
+#else
+        double current = joints_[i]->GetAngle(0).Radian();
+#endif
+
+        target = map_angle_inv(-target/0.776721f,0.0f);
+	double err = current - target;
+        if(joint_max_errors_[i]!=0.) {
+          err = std::max(std::min(err, joint_max_errors_[i]), -joint_max_errors_[i]);
+        }
+        double force = pids_[i].Update(err, _dt);
+        joints_[i]->SetForce(0, force);
+      }
+      else if (joint_control_type_[i] == "position_gimbal_x")
+      {
+#if GAZEBO_MAJOR_VERSION >= 9
+        double current = joints_[i]->Position(0);
+#else
+        double current = joints_[i]->GetAngle(0).Radian();
+#endif
+
+        target = map_angle_inv(target/0.776721f,map_angle_inv(-target/0.776721f,0.0f));
+	double err = current - target;
+        if(joint_max_errors_[i]!=0.) {
+          err = std::max(std::min(err, joint_max_errors_[i]), -joint_max_errors_[i]);
+        }
+        double force = pids_[i].Update(err, _dt);
+        joints_[i]->SetForce(0, force);
+      }
       else
       {
         gzerr << "joint_control_type[" << joint_control_type_[i] << "] undefined.\n";
@@ -1249,5 +1320,10 @@ bool GazeboMavlinkInterface::IsRunning()
 void GazeboMavlinkInterface::onSigInt() {
   mavlink_interface_->onSigInt();
 }
-
+float GazeboMavlinkInterface::map_angle_inv(float servo_angle, float dy){
+	float u = b*b - pow(d + a*cos(servo_angle),2)-c*c-pow(e-a*sin(servo_angle),2);
+	float v = 2*c*cos(dy)*(e-a*sin(servo_angle));
+	float w = -2*c*(d+a*cos(servo_angle));
+	return 2*atan((v-sqrt(w*w+v*v-u*u))/(u+w));
+}
 }
